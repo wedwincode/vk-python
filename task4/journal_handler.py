@@ -18,7 +18,7 @@ class EventType(str, Enum):
 
 @dataclass(slots=True)
 class Event:
-    DATETIME_FORMAT = "%Y-%m-%d %H:%M:%S"
+    TIME_FMT = "%Y-%m-%d %H:%M:%S"
 
     service: str
     dt: datetime
@@ -27,268 +27,205 @@ class Event:
     params: dict[str, str]
 
     @classmethod
-    def from_json(cls, service: str, json_str: str) -> "Event":
-        if not isinstance(service, str) or not service.strip():
-            raise ValueError("service should not be empty")
-
+    def from_json(cls, service: str, s: str) -> "Event":
         try:
-            data = json.loads(json_str)
-        except json.JSONDecodeError as err:
-            raise ValueError(f"invalid json: {err}") from err
-        try:
-            raw_datetime = data["datetime"]
-            raw_event_type = data["event_type"]
-            message = data["message"]
+            data = json.loads(s)
+            msg = data["message"]
             params = data["params"]
-        except KeyError as err:
-            raise ValueError(f"missing required field: {err}") from err
+            if not isinstance(msg, str):
+                raise ValueError("message should be a string")
+            if not isinstance(params, dict):
+                raise ValueError("params should be a dictionary")
+            if not all(isinstance(k, str) and isinstance(v, str) for k, v in params.items()):
+                raise ValueError("params keys and values should be strings")
+            return cls(
+                service=service,
+                dt=datetime.strptime(data["datetime"], cls.TIME_FMT),
+                event_type=EventType(data["event_type"]),
+                message=msg.format(**params),
+                params=params,
+            )
+        except (json.JSONDecodeError, KeyError, ValueError) as err:
+            raise ValueError(f"invalid event: {err}") from err
 
-        if not isinstance(message, str):
-            raise ValueError("message should be a string")
-        if not isinstance(params, dict):
-            raise ValueError("params should be a dictionary")
-        if not all(isinstance(k, str) and isinstance(v, str) for k, v in params.items()):
-            raise ValueError("params keys and values should be strings")
-        try:
-            dt = datetime.strptime(raw_datetime, cls.DATETIME_FORMAT)
-        except ValueError as err:
-            raise ValueError(f"invalid datetime format: {err}") from err
-        try:
-            event_type = EventType(raw_event_type)
-        except ValueError as err:
-            raise ValueError(f"invalid event_type: {raw_event_type}") from err
-        try:
-            message = message.format(**params)
-        except KeyError as err:
-            raise ValueError(f"missing param for message interpolation: {err}") from err
-
-        return cls(service=service, dt=dt, event_type=event_type, message=message, params=params)
-
-@dataclass(slots=True)
-class FileErrorStats:
-    service: str
-    file_hour: datetime
-    error_times: list[datetime]
-    last_error_dt: datetime | None
 
 class JournalHandler:
-    FILE_NAME_PATTERN = re.compile(r"^(?P<service>.+)_(?P<timestamp>\d{10})\.log$")
-    FILE_TIMESTAMP_FORMAT = "%Y%m%d%H"
+    NAME_RE = re.compile(r"^(?P<service>.+)_(?P<hour>\d{10})\.log$")
+    HOUR_FMT = "%Y%m%d%H"
 
     def __init__(self, log_dir: str | Path) -> None:
         self.log_dir = Path(log_dir)
-
-        if not self.log_dir.exists() or not self.log_dir.is_dir():
+        if not self.log_dir.is_dir():
             raise NotADirectoryError("log directory not found")
-
-        self._file_meta_cache: dict[Path, tuple[str, datetime]] = {}
-        self._file_error_stats_cache: dict[Path, FileErrorStats] = {}
+        self._meta: dict[Path, tuple[str, datetime]] = {}
+        self._errors: dict[Path, tuple[str, list[datetime], datetime | None]] = {}
 
     def get_last_events(self, n: int) -> list[Event]:
-        return self._get_last_events_list(n=n)
+        return self._last(n)
 
-    def get_last_events_by_param(self, n: int, param_value: str) -> list[Event]:
-        if not isinstance(param_value, str) or not param_value.strip():
+    def get_last_events_by_param(self, n: int, value: str) -> list[Event]:
+        if not isinstance(value, str) or not value.strip():
             raise ValueError("param_value should not be empty")
-
-        return self._get_last_events_list(n=n, param_value=param_value.strip())
+        return self._last(n, value=value.strip())
 
     def get_last_events_by_service(self, n: int, service: str) -> list[Event]:
         if not isinstance(service, str) or not service.strip():
             raise ValueError("service should not be empty")
+        return self._last(n, service=service.strip())
 
-        return self._get_last_events_list(n=n, service=service.strip())
-
-    def get_errors_counts_by_service(self, time_start: datetime, time_end: datetime) -> dict[str, int]:
-        if time_start > time_end:
+    def get_error_counts_by_service(self, start: datetime, end: datetime) -> dict[str, int]:
+        if start > end:
             raise ValueError("time_start should be earlier than time_end")
-
-        result: dict[str, int] = {}
-        for file_path in self._get_files_for_range(time_start, time_end):
-            stats = self._get_or_build_file_error_stats(file_path)
-            left = bisect_left(stats.error_times, time_start)
-            right = bisect_right(stats.error_times, time_end)
-            count_in_range = right - left
-            if count_in_range > 0:
-                result[stats.service] = result.get(stats.service, 0) + count_in_range
-
-        return result
+        res: dict[str, int] = {}
+        for path in self._files(start=start, end=end):
+            service, times, _ = self._error_stat(path)
+            cnt = bisect_right(times, end) - bisect_left(times, start)
+            if cnt:
+                res[service] = res.get(service, 0) + cnt
+        return res
 
     def get_last_errors_dates_by_service(self) -> dict[str, datetime]:
-        result: dict[str, datetime] = {}
-        for file_path in self._get_files():
-            stats = self._get_or_build_file_error_stats(file_path)
-            if stats.last_error_dt is None:
-                continue
-            current = result.get(stats.service)
-            if current is None or stats.last_error_dt > current:
-                result[stats.service] = stats.last_error_dt
+        res: dict[str, datetime] = {}
+        for path in self._files():
+            service, _, last = self._error_stat(path)
+            if last is not None and (service not in res or last > res[service]):
+                res[service] = last
+        return res
 
-        return result
-
-    def _get_last_events_list(self, n: int, service: str | None = None, param_value: str | None = None) -> list[Event]:
+    def _last(self, n: int, service: str | None = None, value: str | None = None) -> list[Event]:
         if n < 1:
             raise ValueError("n should be greater than 0")
-
-        events: list[Event] = []
-        for event in self._get_last_events_iterator(service=service, param_value=param_value):
-            events.append(event)
-            if len(events) == n:
+        res: list[Event] = []
+        for event in self._iter_last(service, value):
+            res.append(event)
+            if len(res) == n:
                 break
+        return res
 
-        return events
-
-    def _get_last_events_iterator(self, service: str | None = None, param_value: str | None = None) -> Iterator[Event]:
-        if service is not None and not service.strip():
-            raise ValueError("service should not be empty")
-        if param_value is not None and not param_value.strip():
-            raise ValueError("param_value should not be empty")
-
-        iterators: list[Iterator[Event]] = []
-        for file_path in self._get_files(service=service):
-            iterators.append(self._iter_events_reversed(file_path))
+    def _iter_last(self, service: str | None = None, value: str | None = None) -> Iterator[Event]:
+        its = [self._iter_events_rev(p) for p in self._files(service=service)]
         heap: list[tuple[float, int, Event, Iterator[Event]]] = []
-        sequence = count()
-        for iterator in iterators:
+        seq = count()
+
+        for it in its:
             try:
-                event = next(iterator)
+                ev = next(it)
             except StopIteration:
                 continue
-            heapq.heappush(heap, (-event.dt.timestamp(), next(sequence), event, iterator))
+            heapq.heappush(heap, (-ev.dt.timestamp(), next(seq), ev, it))
+
         while heap:
-            _, _, event, iterator = heapq.heappop(heap)
-            if param_value is None or param_value in event.params.values():
-                yield event
+            _, _, ev, it = heapq.heappop(heap)
+            if value is None or value in ev.params.values():
+                yield ev
             try:
-                next_event = next(iterator)
+                nxt = next(it)
             except StopIteration:
                 continue
+            heapq.heappush(heap, (-nxt.dt.timestamp(), next(seq), nxt, it))
 
-            heapq.heappush(heap, (-next_event.dt.timestamp(), next(sequence), next_event, iterator))
+    def _files(
+        self,
+        service: str | None = None,
+        start: datetime | None = None,
+        end: datetime | None = None,
+    ) -> list[Path]:
+        items: list[tuple[datetime, Path]] = []
+        start_h = start and start.replace(minute=0, second=0, microsecond=0)
+        end_h = end and end.replace(minute=0, second=0, microsecond=0)
 
-    def _get_files(self, service: str | None = None) -> list[Path]:
-        files_with_timestamps: list[tuple[datetime, Path]] = []
-        for file_path in self.log_dir.iterdir():
-            if not file_path.is_file():
+        for path in self.log_dir.iterdir():
+            if not path.is_file():
                 continue
             try:
-                file_service, file_timestamp = self._get_file_meta(file_path)
+                srv, hour = self._file_meta(path)
             except ValueError:
                 continue
-            if service is not None and file_service != service:
+            if service is not None and srv != service:
                 continue
-            files_with_timestamps.append((file_timestamp, file_path))
-
-        files_with_timestamps.sort(key=lambda item: item[0], reverse=True)
-        return [file_path for _, file_path in files_with_timestamps]
-
-    def _get_files_for_range(self, time_start: datetime, time_end: datetime) -> list[Path]:
-        relevant_files: list[tuple[datetime, Path]] = []
-        start_hour = time_start.replace(minute=0, second=0, microsecond=0)
-        end_hour = time_end.replace(minute=0, second=0, microsecond=0)
-
-        for file_path in self.log_dir.iterdir():
-            if not file_path.is_file():
+            if start_h is not None and hour < start_h:
                 continue
-            try:
-                _, file_hour = self._get_file_meta(file_path)
-            except ValueError:
+            if end_h is not None and hour > end_h:
                 continue
-            if start_hour <= file_hour <= end_hour:
-                relevant_files.append((file_hour, file_path))
+            items.append((hour, path))
 
-        relevant_files.sort(key=lambda item: item[0], reverse=True)
-        return [file_path for _, file_path in relevant_files]
+        items.sort(key=lambda x: x[0], reverse=True)
+        return [p for _, p in items]
 
-    def _get_or_build_file_error_stats(self, file_path: Path) -> FileErrorStats:
-        cached = self._file_error_stats_cache.get(file_path)
-        if cached is not None:
-            return cached
-
-        service, file_hour = self._get_file_meta(file_path)
-        error_times: list[datetime] = []
-        for line in self._iter_lines(file_path):
-            event = Event.from_json(service, line)
-            if event.dt.strftime(self.FILE_TIMESTAMP_FORMAT) != file_hour.strftime(self.FILE_TIMESTAMP_FORMAT):
-                raise ValueError(f"event datetime does not match file hour: {file_path.name}")
-            if event.event_type is EventType.ERROR:
-                error_times.append(event.dt)
-        last_error_dt = error_times[-1] if error_times else None
-
-        stats = FileErrorStats(service, file_hour, error_times, last_error_dt)
-        self._file_error_stats_cache[file_path] = stats
-        return stats
-
-    def _get_file_meta(self, file_path: Path) -> tuple[str, datetime]:
-        cached = self._file_meta_cache.get(file_path)
-        if cached is not None:
-            return cached
-
-        match = self.FILE_NAME_PATTERN.match(file_path.name)
-        if match is None:
-            raise ValueError(f"invalid file name: {file_path.name}")
+    def _file_meta(self, path: Path) -> tuple[str, datetime]:
+        if path in self._meta:
+            return self._meta[path]
+        m = self.NAME_RE.match(path.name)
+        if m is None:
+            raise ValueError(f"invalid file name: {path.name}")
         try:
-            file_timestamp = datetime.strptime(match.group("timestamp"), self.FILE_TIMESTAMP_FORMAT)
+            meta = (m.group("service"), datetime.strptime(m.group("hour"), self.HOUR_FMT))
         except ValueError as err:
-            raise ValueError(f"invalid timestamp in file name: {file_path.name}") from err
+            raise ValueError(f"invalid file name: {path.name}") from err
+        self._meta[path] = meta
+        return meta
 
-        result = (match.group("service"), file_timestamp)
-        self._file_meta_cache[file_path] = result
-        return result
+    def _error_stat(self, path: Path) -> tuple[str, list[datetime], datetime | None]:
+        if path in self._errors:
+            return self._errors[path]
+        service, hour = self._file_meta(path)
+        times: list[datetime] = []
+        for line in self._iter_lines(path):
+            ev = Event.from_json(service, line)
+            if ev.dt.strftime(self.HOUR_FMT) != hour.strftime(self.HOUR_FMT):
+                raise ValueError(f"event datetime does not match file hour: {path.name}")
+            if ev.event_type is EventType.ERROR:
+                times.append(ev.dt)
+        stat = (service, times, times[-1] if times else None)
+        self._errors[path] = stat
+        return stat
 
-    def _iter_events_reversed(self, file_path: Path) -> Iterator[Event]:
-        service, file_dt = self._get_file_meta(file_path)
-        for line in self._iter_lines_reversed(file_path):
-            event = Event.from_json(service, line)
-            if event.dt.strftime(self.FILE_TIMESTAMP_FORMAT) != file_dt.strftime(self.FILE_TIMESTAMP_FORMAT):
-                raise ValueError(f"event datetime does not match file hour: {file_path.name}")
-            yield event
+    def _iter_events_rev(self, path: Path) -> Iterator[Event]:
+        service, hour = self._file_meta(path)
+        for line in self._iter_lines(path, True):
+            ev = Event.from_json(service, line)
+            if ev.dt.strftime(self.HOUR_FMT) != hour.strftime(self.HOUR_FMT):
+                raise ValueError(f"event datetime does not match file hour: {path.name}")
+            yield ev
 
     @staticmethod
-    def _iter_lines(file_path: Path) -> Iterator[str]:
-        with file_path.open("rb") as file:
-            for line in file:
-                line = line.rstrip(b"\n")
-                if not line:
-                    continue
-                try:
-                    yield line.decode("utf-8")
-                except UnicodeDecodeError as err:
-                    raise ValueError(f"invalid utf-8 in file {file_path}") from err
-
-    @staticmethod
-    def _iter_lines_reversed(file_path: Path, chunk_size: int = 4096) -> Iterator[str]:
-        with file_path.open("rb") as file:
-            file.seek(0, 2)
-            position = file.tell()
-            buffer = b""
-
-            while position > 0:
-                read_size = min(chunk_size, position)
-                position -= read_size
-                file.seek(position)
-                chunk = file.read(read_size)
-                buffer = chunk + buffer
-
-                lines = buffer.split(b"\n")
-                buffer = lines[0]
-
-                for line in reversed(lines[1:]):
+    def _iter_lines(path: Path, rev: bool = False, chunk: int = 4096) -> Iterator[str]:
+        with path.open("rb") as f:
+            if not rev:
+                for line in f:
+                    line = line.rstrip(b"\n")
                     if line:
                         try:
-                            yield line.decode("utf-8")
+                            yield line.decode()
                         except UnicodeDecodeError as err:
-                            raise ValueError(f"invalid utf-8 in file {file_path}") from err
+                            raise ValueError(f"invalid utf-8 in file {path}") from err
+                return
 
-            if buffer:
+            f.seek(0, 2)
+            pos = f.tell()
+            buf = b""
+            while pos > 0:
+                size = min(chunk, pos)
+                pos -= size
+                f.seek(pos)
+                buf = f.read(size) + buf
+                parts = buf.split(b"\n")
+                buf = parts[0]
+                for line in reversed(parts[1:]):
+                    if line:
+                        try:
+                            yield line.decode()
+                        except UnicodeDecodeError as err:
+                            raise ValueError(f"invalid utf-8 in file {path}") from err
+            if buf:
                 try:
-                    yield buffer.decode("utf-8")
+                    yield buf.decode()
                 except UnicodeDecodeError as err:
-                    raise ValueError(f"invalid utf-8 in file {file_path}") from err
+                    raise ValueError(f"invalid utf-8 in file {path}") from err
 
 journal = JournalHandler("logs")
 res = journal.get_last_events_by_service(n=3, service="backend")
-print(journal.get_errors_counts_by_service(time_start=datetime(2025, 1, 1), time_end=datetime(2027, 1, 1)))
+print(journal.get_error_counts_by_service(start=datetime(2025, 1, 1), end=datetime(2027, 1, 1)))
 print(journal.get_last_errors_dates_by_service())
 for e in res:
     print(e)
